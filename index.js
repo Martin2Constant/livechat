@@ -1,72 +1,56 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits } = require('discord.js');
-const WebSocket = require('ws');
-const http = require('http'); // On importe le module HTTP natif de Node.js
+const { Client, Events, GatewayIntentBits } = require('discord.js');
+const { createRelayServer } = require('./server');
+const { createMessageHandler, readConfig } = require('./relay');
 
-// --- 1. CRÉATION DU MINI-SERVEUR WEB POUR UPTIMEROBOT ---
-const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Le bot Livechat est réveillé !');
-});
-
-// --- 2. CONFIGURATION WEBSOCKET (Branché sur le serveur web) ---
-const wss = new WebSocket.Server({ server });
-
-wss.on('connection', (ws) => {
-    console.log('Un client (Overlay) vient de se connecter au WebSocket !');
-    ws.on('close', () => console.log('Un client s\'est déconnecté.'));
-});
-
-function broadcastMedia(url, text, author, avatar) {
-    wss.clients.forEach(function each(client) {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({ 
-                type: 'play_media', url: url, text: text, author: author, avatar: avatar 
-            }));
+async function main() {
+    const config = readConfig(process.env);
+    const client = new Client({
+        intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+    });
+    const relay = createRelayServer({ isReady: () => client.isReady() });
+    let stopping = false;
+    let shutdownPromise;
+    const shutdown = () => {
+        if (!shutdownPromise) {
+            stopping = true;
+            shutdownPromise = (async () => {
+                try { await client.destroy(); }
+                finally { await relay.close(); }
+            })();
         }
+        return shutdownPromise;
+    };
+    const onSignal = () => { shutdown().catch(error => {
+        console.error('Erreur pendant l’arrêt :', error.message);
+        process.exitCode = 1;
+    }); };
+    process.once('SIGINT', onSignal);
+    process.once('SIGTERM', onSignal);
+    client.once(Events.ClientReady, () => {
+        console.log(`Bot Discord connecté en tant que ${client.user.tag}`);
+    });
+    client.on(Events.Error, error => console.error('Erreur Discord :', error.message));
+    client.on(Events.ShardError, error => console.error('Erreur de connexion Discord :', error.message));
+    client.on(Events.MessageCreate, createMessageHandler({ config, broadcast: relay.broadcast }));
+
+    try {
+        await relay.listen(config.port);
+        if (stopping) return;
+        console.log(`Serveur HTTP et WebSocket en écoute sur le port ${config.port}`);
+        await client.login(config.token);
+        if (stopping) await client.destroy();
+    } catch (error) {
+        await shutdown();
+        throw error;
+    }
+}
+
+if (require.main === module) {
+    main().catch(error => {
+        console.error('Démarrage impossible :', error.message);
+        process.exitCode = 1;
     });
 }
 
-// --- 3. CONFIGURATION DISCORD BOT ---
-const client = new Client({ 
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] 
-});
-
-client.once('ready', () => {
-    console.log(`Bot Discord connecté en tant que ${client.user.tag}`);
-});
-
-client.on('messageCreate', (message) => {
-    if (message.author.bot) return;
-
-    if (message.content.startsWith('!livechat')) {
-        let mediaUrl = null;
-        let textContent = '';
-
-        if (message.attachments.size > 0) {
-            mediaUrl = message.attachments.first().url;
-            textContent = message.content.replace('!livechat', '').trim();
-        } else {
-            const args = message.content.split(' ');
-            mediaUrl = args[1];
-            textContent = args.slice(2).join(' ').trim();
-        }
-
-        if (mediaUrl) {
-            const avatarUrl = message.author.displayAvatarURL({ extension: 'png', size: 128 });
-            broadcastMedia(mediaUrl, textContent, message.author.username, avatarUrl);
-            message.reply('🎥 Média envoyé sur l\'overlay !');
-        } else {
-            message.reply('❌ Tu dois fournir un lien OU glisser-déposer une vidéo avec ton message !');
-        }
-    }
-});
-
-// --- 4. LANCEMENT GLOBAL ---
-client.login(process.env.DISCORD_TOKEN);
-
-// Le serveur écoute sur le port défini par l'hébergeur, ou 8080 en local
-const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => {
-    console.log(`Serveur Web et WebSocket en écoute sur le port ${PORT}`);
-});
+module.exports = { main };
